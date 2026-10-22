@@ -38,6 +38,7 @@ from .scale_up import (
     StandbyRunner,
     ScaleUpFailureMessage,
     get_runner_server_name,
+    job_matches_labels,
 )
 from .logger import logger
 from .server import age
@@ -46,6 +47,7 @@ from .hclient import HClient as Client
 from .ordered_set import OrderedSet as set
 
 from github import Auth, Github
+from github.GithubException import UnknownObjectException
 from github.Repository import Repository
 from github.SelfHostedActionsRunner import SelfHostedActionsRunner
 
@@ -100,6 +102,92 @@ class UnusedRunner:
     time: float
     runner: SelfHostedActionsRunner
     observed_interval: float
+    deregistered: bool = False
+    server_id: int | None = None
+
+
+def managed_server(server, ssh_key, with_label):
+    labels = [
+        value.lower()
+        for name, value in server.labels.items()
+        if name.startswith("github-hetzner-runner-label")
+    ]
+    return (
+        server.name.startswith(server_name_prefix)
+        and server.labels.get(github_runner_label) == "active"
+        and server.labels.get(server_ssh_key_label) == ssh_key.name
+        and job_matches_labels(labels, with_label) is True
+    )
+
+
+def managed_runner(runner, with_label):
+    return (
+        runner.name.startswith(runner_name_prefix)
+        and job_matches_labels(
+            [label["name"].lower() for label in runner.labels], with_label
+        )
+        is True
+    )
+
+
+def remove_idle_runner(repo, runner, with_label):
+    """Deregister before deleting the VM; GitHub rejects removal of busy runners."""
+    try:
+        current = repo.get_self_hosted_runner(runner.id)
+        if (
+            current.name != runner.name
+            or not managed_runner(current, with_label)
+            or current.busy
+            or current.status not in ("online", "offline")
+        ):
+            return False
+        return repo.remove_self_hosted_runner(current)
+    except UnknownObjectException as exc:
+        if exc.status == 404:
+            return not any(
+                current.id == runner.id for current in repo.get_self_hosted_runners()
+            )
+        raise
+
+
+def prepare_server_cleanup(
+    client,
+    repo,
+    server,
+    ssh_key,
+    with_label,
+    expected_status,
+    require_unregistered=False,
+):
+    """Revalidate ownership and status, then stop GitHub assigning new work."""
+    if expected_status not in (BoundServer.STATUS_RUNNING, BoundServer.STATUS_OFF):
+        return None
+
+    def refresh():
+        current = client.servers.get_by_id(server.id)
+        if (
+            current is None
+            or current.name != server.name
+            or not managed_server(current, ssh_key, with_label)
+            or current.status != expected_status
+        ):
+            return None
+        return current
+
+    current = refresh()
+    if current is None:
+        return None
+    runners = [
+        runner
+        for runner in repo.get_self_hosted_runners()
+        if get_runner_server_name(runner.name) == server.name
+    ]
+    if require_unregistered and runners:
+        return None
+    for runner in runners:
+        if not remove_idle_runner(repo, runner, with_label):
+            return None
+    return refresh()
 
 
 def delete_server(server: BoundServer, action: str = "delete"):
@@ -110,7 +198,8 @@ def delete_server(server: BoundServer, action: str = "delete"):
         action: The action being performed (e.g., "powered_off_delete", "zombie_delete", "unused_delete")
     """
     try:
-        server.delete()
+        deletion = server.delete()
+        deletion.wait_until_finished(max_retries=60)
     except Exception as e:
         # Record scale down failure
         server_labels = set(
@@ -146,6 +235,10 @@ def delete_recyclable_server(
     server_name,
     recyclable_servers: list[BoundServer],
     server_prices: dict[str, dict[str, float]],
+    client,
+    repo,
+    ssh_key,
+    with_label,
     recycle_grace_period: int | None = None,
     stack_level=2,
 ):
@@ -233,9 +326,13 @@ def delete_recyclable_server(
         ignore_fail=True,
         server_name=server_name,
     ):
+        recyclable_server = prepare_server_cleanup(
+            client, repo, recyclable_server, ssh_key, with_label, BoundServer.STATUS_OFF
+        )
+        if recyclable_server is None:
+            return None
         delete_server(recyclable_server, action="delete_recyclable")
-
-    return recyclable_server.name
+        return recyclable_server.name
 
 
 def recycle_server(
@@ -262,33 +359,8 @@ def recycle_server(
     """
     days, hours, minutes, _ = age(server=server)
 
-    if not server_ssh_key_label in server.labels:
-        with Action(
-            f"Try deleting {reason} server {server.name} "
-            f"used {days}d{hours}h{minutes}m "
-            "as it has no SSH key label",
-            stacklevel=3,
-            ignore_fail=True,
-            server_name=server.name,
-        ):
-            try:
-                delete_server(server, action=f"delete_{reason}_no_ssh_key")
-            finally:
-                return
-
-    if server.labels[server_ssh_key_label] != ssh_key.name:
-        with Action(
-            f"Try deleting {reason} server {server.name} "
-            f"used {days}d{hours}h{minutes}m "
-            "as it has a different SSH key",
-            stacklevel=3,
-            ignore_fail=True,
-            server_name=server.name,
-        ):
-            try:
-                delete_server(server, action=f"delete_{reason}_wrong_ssh_key")
-            finally:
-                return
+    if not managed_server(server, ssh_key, None):
+        return
 
     if minutes >= end_of_life:
         # Only enforce grace period for servers already marked for recycling by name.
@@ -380,6 +452,7 @@ def scale_down(
     max_unused_runner_time: int = config.max_unused_runner_time
     max_runner_registration_time: int = config.max_runner_registration_time
     server_prices: dict[str, dict[str, float]] = config.server_prices
+    with_label: list[str] = config.with_label
     powered_off_servers: dict[str, PoweredOffServer] = {}
     unused_runners: dict[str, UnusedRunner] = {}
     zombie_servers: dict[str, ZombieServer] = {}
@@ -411,9 +484,13 @@ def scale_down(
             with Action(
                 "Getting list of servers", level=logging.DEBUG, interval=interval
             ):
-                servers: list[BoundServer] = client.servers.get_all(
-                    label_selector=f"{github_runner_label}=active"
-                )
+                servers: list[BoundServer] = [
+                    server
+                    for server in client.servers.get_all(
+                        label_selector=f"{github_runner_label}=active"
+                    )
+                    if managed_server(server, ssh_key, with_label)
+                ]
 
             with Action(
                 "Getting runner labels for each server",
@@ -435,7 +512,11 @@ def scale_down(
                 level=logging.DEBUG,
                 interval=interval,
             ):
-                runners: list[SelfHostedActionsRunner] = repo.get_self_hosted_runners()
+                runners: list[SelfHostedActionsRunner] = [
+                    runner
+                    for runner in repo.get_self_hosted_runners()
+                    if managed_runner(runner, with_label)
+                ]
 
             if recycle:
                 with Action(
@@ -456,8 +537,14 @@ def scale_down(
             ):
                 for server in servers:
                     if server.status == server.STATUS_OFF:
-                        if not server.name.startswith(recycle_server_name_prefix):
-                            if server.name not in powered_off_servers:
+                        if not recycle or not server.name.startswith(
+                            recycle_server_name_prefix
+                        ):
+                            if (
+                                server.name not in powered_off_servers
+                                or powered_off_servers[server.name].server.id
+                                != server.id
+                            ):
                                 with Action(
                                     f"Found new powered off server {server.name}",
                                     server_name=server.name,
@@ -478,10 +565,13 @@ def scale_down(
                             [
                                 runner.name
                                 for runner in runners
-                                if runner.name.startswith(server.name)
+                                if get_runner_server_name(runner.name) == server.name
                             ]
                         ):
-                            if server.name not in zombie_servers:
+                            if (
+                                server.name not in zombie_servers
+                                or zombie_servers[server.name].server.id != server.id
+                            ):
                                 with Action(
                                     f"Found new potential zombie server {server.name}",
                                     server_name=server.name,
@@ -528,7 +618,10 @@ def scale_down(
                                         break
                                 if found:
                                     continue
-                            if runner.name not in unused_runners:
+                            if (
+                                runner.name not in unused_runners
+                                or unused_runners[runner.name].runner.id != runner.id
+                            ):
                                 with Action(
                                     f"Found new unused runner {runner.name}",
                                     server_name=get_runner_server_name(runner.name),
@@ -601,7 +694,7 @@ def scale_down(
 
                     if powered_off_server.observed_interval != current_interval:
                         with Action(
-                            f"Forgetting about powered off server {server.name}",
+                            f"Forgetting about powered off server {server_name}",
                             server_name=server_name,
                             interval=interval,
                         ):
@@ -612,31 +705,38 @@ def scale_down(
                             current_interval - powered_off_server.time
                             > max_powered_off_time
                         ):
-                            if recycle:
-                                recycle_server(
-                                    reason="powered_off",
-                                    server=powered_off_server.server,
-                                    ssh_key=ssh_key,
-                                    end_of_life=end_of_life,
-                                    recycle_grace_period=recycle_grace_period,
+                            with Action(
+                                f"Cleaning up powered off server {server_name}",
+                                ignore_fail=True,
+                                server_name=server_name,
+                                interval=interval,
+                            ):
+                                server = prepare_server_cleanup(
+                                    client,
+                                    repo,
+                                    powered_off_server.server,
+                                    ssh_key,
+                                    with_label,
+                                    BoundServer.STATUS_OFF,
                                 )
-                            else:
-                                with Action(
-                                    f"Deleting powered off server {server_name}",
-                                    ignore_fail=True,
-                                    server_name=server_name,
-                                    interval=interval,
-                                ) as action:
+                                if server is None:
+                                    continue
+                                if recycle:
+                                    recycle_server(
+                                        reason="powered_off",
+                                        server=server,
+                                        ssh_key=ssh_key,
+                                        end_of_life=end_of_life,
+                                        recycle_grace_period=recycle_grace_period,
+                                    )
+                                else:
+                                    delete_server(server, action="delete_powered_off")
                                     metrics.record_server_deletion(
-                                        server_type=powered_off_server.server.server_type.name,
-                                        location=powered_off_server.server.location.name,
+                                        server_type=server.server_type.name,
+                                        location=server.location.name,
                                         reason="powered_off",
                                     )
-                                    delete_server(
-                                        powered_off_server.server,
-                                        action="delete_powered_off",
-                                    )
-                            powered_off_servers.pop(server_name)
+                                powered_off_servers.pop(server_name)
 
             with Action(
                 "Checking which zombie servers need to be deleted",
@@ -659,30 +759,39 @@ def scale_down(
                             current_interval - zombie_server.time
                             > max_runner_registration_time
                         ):
-                            if recycle:
-                                recycle_server(
-                                    reason="zombie",
-                                    server=zombie_server.server,
-                                    ssh_key=ssh_key,
-                                    end_of_life=end_of_life,
-                                    recycle_grace_period=recycle_grace_period,
+                            with Action(
+                                f"Cleaning up zombie server {server_name}",
+                                ignore_fail=True,
+                                server_name=server_name,
+                                interval=interval,
+                            ):
+                                server = prepare_server_cleanup(
+                                    client,
+                                    repo,
+                                    zombie_server.server,
+                                    ssh_key,
+                                    with_label,
+                                    BoundServer.STATUS_RUNNING,
+                                    require_unregistered=True,
                                 )
-                            else:
-                                with Action(
-                                    f"Deleting zombie server {server_name}",
-                                    ignore_fail=True,
-                                    server_name=server_name,
-                                    interval=interval,
-                                ) as action:
+                                if server is None:
+                                    continue
+                                if recycle:
+                                    recycle_server(
+                                        reason="zombie",
+                                        server=server,
+                                        ssh_key=ssh_key,
+                                        end_of_life=end_of_life,
+                                        recycle_grace_period=recycle_grace_period,
+                                    )
+                                else:
+                                    delete_server(server, action="delete_zombie")
                                     metrics.record_server_deletion(
-                                        server_type=zombie_server.server.server_type.name,
-                                        location=zombie_server.server.location.name,
+                                        server_type=server.server_type.name,
+                                        location=server.location.name,
                                         reason="zombie",
                                     )
-                                    delete_server(
-                                        zombie_server.server, action="delete_zombie"
-                                    )
-                            zombie_servers.pop(server_name)
+                                zombie_servers.pop(server_name)
 
             with Action(
                 "Checking which unused runners need to be removed",
@@ -692,7 +801,10 @@ def scale_down(
                 for runner_name in list(unused_runners.keys()):
                     unused_runner = unused_runners[runner_name]
 
-                    if unused_runner.observed_interval != current_interval:
+                    if (
+                        unused_runner.observed_interval != current_interval
+                        and not unused_runner.deregistered
+                    ):
                         with Action(
                             f"Forgetting about unused runner {runner_name}",
                             server_name=get_runner_server_name(runner_name),
@@ -705,10 +817,8 @@ def scale_down(
                             current_interval - unused_runner.time
                             > max_unused_runner_time
                         ):
-                            runner_server = None
-
                             with Action(
-                                f"Try to find server for the runner {runner_name}",
+                                f"Cleaning up unused runner {runner_name}",
                                 ignore_fail=True,
                                 server_name=get_runner_server_name(runner_name),
                                 interval=interval,
@@ -716,8 +826,30 @@ def scale_down(
                                 runner_server = client.servers.get_by_name(
                                     get_runner_server_name(runner_name)
                                 )
-
-                            if runner_server is not None:
+                                if runner_server is None:
+                                    if remove_idle_runner(
+                                        repo, unused_runner.runner, with_label
+                                    ):
+                                        unused_runners.pop(runner_name)
+                                    continue
+                                if (
+                                    unused_runner.server_id is not None
+                                    and unused_runner.server_id != runner_server.id
+                                ):
+                                    unused_runners.pop(runner_name)
+                                    continue
+                                runner_server = prepare_server_cleanup(
+                                    client,
+                                    repo,
+                                    runner_server,
+                                    ssh_key,
+                                    with_label,
+                                    runner_server.status,
+                                )
+                                if runner_server is None:
+                                    continue
+                                unused_runner.deregistered = True
+                                unused_runner.server_id = runner_server.id
                                 if recycle:
                                     recycle_server(
                                         reason="unused_runner",
@@ -727,31 +859,13 @@ def scale_down(
                                         recycle_grace_period=recycle_grace_period,
                                     )
                                 else:
-                                    with Action(
-                                        f"Deleting unused runner server {runner_server.name}",
-                                        ignore_fail=True,
-                                        server_name=runner_server.name,
-                                        interval=interval,
-                                    ):
-                                        metrics.record_server_deletion(
-                                            server_type=runner_server.server_type.name,
-                                            location=runner_server.location.name,
-                                            reason="unused",
-                                        )
-                                        delete_server(
-                                            runner_server, action="delete_unused"
-                                        )
-                                runner_server = None
-
-                            if runner_server is None:
-                                with Action(
-                                    f"Removing self-hosted runner {runner_name}",
-                                    ignore_fail=True,
-                                    server_name=get_runner_server_name(runner_name),
-                                    interval=interval,
-                                ):
-                                    repo.remove_self_hosted_runner(unused_runner.runner)
-                                    unused_runners.pop(runner_name)
+                                    delete_server(runner_server, action="delete_unused")
+                                    metrics.record_server_deletion(
+                                        server_type=runner_server.server_type.name,
+                                        location=runner_server.location.name,
+                                        reason="unused",
+                                    )
+                                unused_runners.pop(runner_name)
 
             with Action(
                 "Checking which recyclable servers need to be deleted",
@@ -761,15 +875,30 @@ def scale_down(
                 for server_name in list(recyclable_servers.keys()):
                     if terminate.is_set():
                         break
-                    recyclable_server = recyclable_servers[server_name]
-                    recycle_server(
-                        reason="unused_recyclable",
-                        server=recyclable_server,
-                        ssh_key=ssh_key,
-                        end_of_life=end_of_life,
-                        recycle_grace_period=recycle_grace_period,
-                    )
-                    recyclable_servers.pop(server_name)
+                    with Action(
+                        f"Cleaning up recyclable server {server_name}",
+                        ignore_fail=True,
+                        server_name=server_name,
+                        interval=interval,
+                    ):
+                        recyclable_server = prepare_server_cleanup(
+                            client,
+                            repo,
+                            recyclable_servers[server_name],
+                            ssh_key,
+                            with_label,
+                            BoundServer.STATUS_OFF,
+                        )
+                        if recyclable_server is None:
+                            continue
+                        recycle_server(
+                            reason="unused_recyclable",
+                            server=recyclable_server,
+                            ssh_key=ssh_key,
+                            end_of_life=end_of_life,
+                            recycle_grace_period=recycle_grace_period,
+                        )
+                        recyclable_servers.pop(server_name)
 
             with Action(
                 "Checking which recyclable servers need to be deleted to try to resolve scale up failures",
@@ -829,6 +958,10 @@ def scale_down(
                                             recyclable_servers.values()
                                         ),
                                         server_prices=server_prices,
+                                        client=client,
+                                        repo=repo,
+                                        ssh_key=ssh_key,
+                                        with_label=with_label,
                                         recycle_grace_period=recycle_grace_period,
                                         stack_level=3,
                                         server_name=server_name,

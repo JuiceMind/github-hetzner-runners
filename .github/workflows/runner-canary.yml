@@ -1,0 +1,74 @@
+name: Hetzner runner canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: Number of simultaneous workers
+        type: choice
+        options: ['1', '5', '25', '30']
+        default: '1'
+      outcome:
+        description: Expected job outcome
+        type: choice
+        options: [success, failure]
+        default: success
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hetzner-runner-canary
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          workers = int(os.environ['WORKERS'])
+          if workers not in (1, 5, 25, 30):
+              raise SystemExit('Unsupported worker count')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(list(range(1, workers + 1))) + '\n')
+          PY
+  worker:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 30
+      matrix:
+        worker: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on:
+      - self-hosted
+      - juicemind-autoscale-v2
+      - image-x86-snapshot-runner-ubuntu26-x86-docker-20260722
+      - setup-none
+      - type-cx33-cpx32
+      - in-nbg1-fsn1-hel1
+    timeout-minutes: 10
+    steps:
+      - name: Verify worker and hold overlap window
+        env:
+          EXPECTED_OUTCOME: ${{ inputs.outcome }}
+        run: |
+          set -eu
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          uname -m
+          docker info --format 'Docker {{.ServerVersion}}'
+          sleep 180
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          if [ "$EXPECTED_OUTCOME" = failure ]; then
+            echo 'Intentional failure to verify worker cleanup'
+            exit 1
+          fi

@@ -1,0 +1,41 @@
+name: Autoscaler regression tests
+
+on:
+  push:
+    branches: [main, fix/reliable-autoscaling]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies
+        run: |
+          python - <<'PY'
+          import ast
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          tree = ast.parse(Path('setup.py').read_text())
+          setup = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Name)
+                       and node.func.id == 'setup')
+          dependencies = next(ast.literal_eval(keyword.value)
+                              for keyword in setup.keywords
+                              if keyword.arg == 'install_requires')
+          subprocess.run([sys.executable, '-m', 'pip', 'install', *dependencies], check=True)
+          PY
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+

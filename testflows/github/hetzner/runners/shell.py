@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
-import time
+import os
+import signal
+import threading
 import subprocess
 
 from .logger import logger
@@ -26,6 +28,7 @@ def shell(
     use_logger=True,
     stacklevel=2,
     server_name=None,
+    timeout=None,
 ):
     """Execute command."""
     p = subprocess.Popen(
@@ -37,26 +40,50 @@ def shell(
         universal_newlines=True,
         text=True,
         encoding="utf-8",
+        start_new_session=timeout is not None,
     )
 
-    for line in iter(p.stdout.readline, ""):
-        if line == "":
-            time.sleep(0.1)
-            continue
-        if use_logger:
-            logger.info(
-                f"   > {line.rstrip()}",
-                stacklevel=stacklevel,
-                extra={"server_name": server_name},
-            )
-        else:
-            sys.stdout.write(line.rstrip())
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+    expired = threading.Event()
 
-    p.wait()
+    def expire():
+        expired.set()
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
-    if check:
-        assert p.returncode == 0, f"{cmd} returned non-zero exit code {p.returncode}"
+    timer = None
+    if timeout is not None:
+        timer = threading.Timer(max(0, timeout), expire)
+        timer.daemon = True
+        timer.start()
+    try:
+        for line in iter(p.stdout.readline, ""):
+            if use_logger:
+                logger.info(
+                    f"   > {line.rstrip()}",
+                    stacklevel=stacklevel,
+                    extra={"server_name": server_name},
+                )
+            else:
+                sys.stdout.write(line.rstrip())
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+        p.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+        if p.poll() is None:
+            if timeout is not None:
+                expire()
+            else:
+                p.kill()
+            p.wait()
+        p.stdout.close()
 
+    if expired.is_set():
+        raise TimeoutError(f"Command exceeded {timeout}s")
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command returned non-zero exit code {p.returncode}")
     return p.returncode

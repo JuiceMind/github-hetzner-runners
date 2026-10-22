@@ -19,13 +19,20 @@ import logging
 import threading
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 from .actions import Action
 from .request import request
 from .args import image_type
 from .logger import logger
 from . import metrics
-from .config import Config, check_image, check_startup_script, check_setup_script, check_recycle_script
+from .config import (
+    Config,
+    check_image,
+    check_startup_script,
+    check_setup_script,
+    check_recycle_script,
+)
 from .config import standby_runner as StandbyRunner
 from .hclient import HClient as Client
 from .utils import get_runner_server_type_and_location
@@ -44,6 +51,7 @@ from .server import wait_ssh, ssh, get_runner_server_name
 from .ordered_set import OrderedSet as set
 
 from hcloud import APIException
+from hcloud.actions.domain import ActionFailedException
 from hcloud.ssh_keys.domain import SSHKey
 from hcloud.server_types.domain import ServerType
 from hcloud.locations.domain import Location
@@ -60,7 +68,11 @@ from github.GithubException import GithubException
 
 from requests.exceptions import RetryError as RequestsRetryError
 
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    Future,
+    TimeoutError as FutureTimeoutError,
+)
 
 # Lock to access the volumes list
 volumes_lock = threading.Lock()
@@ -86,12 +98,6 @@ class MaxNumberOfServersReached(Exception):
 class MaxNumberOfServersForLabelReached(Exception):
     """Exception to indicate that server can't be created
     because label-specific limit has been reached."""
-
-    pass
-
-
-class CanceledServerCreation(Exception):
-    """Exception to indicate that server creation was canceled."""
 
     pass
 
@@ -149,12 +155,24 @@ def server_setup(
     github_repository: str,
     runner_labels: str,
     timeout: float = 60,
+    deadline: float = None,
 ):
     """Setup new server instance."""
     cache_volume_name = "cache"
+    if deadline is None:
+        deadline = time.monotonic() + timeout
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError(f"Setup of {server.name} exceeded {timeout}s")
+        return budget
+
+    def run_ssh(*args, **kwargs):
+        return ssh(*args, timeout=remaining(), **kwargs)
 
     with Action("Wait for SSH connection to be ready", server_name=server.name):
-        wait_ssh(server=server, timeout=timeout)
+        wait_ssh(server=server, timeout=remaining())
 
     with Action("Getting registration token for the runner", server_name=server.name):
         content, resp = request(
@@ -166,12 +184,14 @@ def server_setup(
             },
             data={},
             format="json",
+            timeout=min(60, remaining()),
+            max_retries=0,
         )
         GITHUB_RUNNER_TOKEN = content["token"]
 
     with Action("Resizing and mounting volumes", server_name=server.name):
         if server.volumes:
-            ssh(
+            run_ssh(
                 server,
                 "'sudo echo \"name,id,size,mount,device,used,free,usage\" > /etc/hetzner-volumes'",
                 stacklevel=5,
@@ -181,7 +201,7 @@ def server_setup(
 
         for volume in sorted(server.volumes, key=lambda v: v.name):
             volume_name = get_volume_name(volume.name)
-            ssh(
+            run_ssh(
                 server,
                 (
                     f"'sudo mkdir -p /mnt/{volume_name} "
@@ -201,7 +221,7 @@ def server_setup(
                 with Action(
                     "Mounting apt-archives and apt-lists cache", server_name=server.name
                 ):
-                    ssh(
+                    run_ssh(
                         server,
                         (
                             f"'sudo mkdir -p /mnt/{volume_name}/apt-archives /mnt/{volume_name}/apt-lists /var/cache/apt/archives /var/lib/apt/lists "
@@ -215,7 +235,7 @@ def server_setup(
                     "Check apt-lists validity and clear if invalid",
                     server_name=server.name,
                 ):
-                    ssh(
+                    run_ssh(
                         server,
                         (
                             "'if ! sudo apt-get update -qq; then "
@@ -228,8 +248,10 @@ def server_setup(
                         stacklevel=5,
                     )
 
-    with Action(f"Executing {os.path.basename(setup_script)} script", server_name=server.name):
-        ssh(
+    with Action(
+        f"Executing {os.path.basename(setup_script)} script", server_name=server.name
+    ):
+        run_ssh(
             server,
             f'CACHE_DIR="/mnt/{cache_volume_name}" bash -s  < {setup_script}',
             stacklevel=5,
@@ -238,14 +260,16 @@ def server_setup(
     with Action("Updating volumes permissions", server_name=server.name):
         for volume in server.volumes:
             volume_name = get_volume_name(volume.name)
-            ssh(
+            run_ssh(
                 server,
                 (f"'sudo chown ubuntu:ubuntu /mnt/{volume_name}'"),
                 stacklevel=5,
             )
 
-    with Action(f"Executing {os.path.basename(startup_script)} script", server_name=server.name):
-        ssh(
+    with Action(
+        f"Executing {os.path.basename(startup_script)} script", server_name=server.name
+    ):
+        run_ssh(
             server,
             f"'sudo -u ubuntu "
             f'CACHE_DIR="/mnt/{cache_volume_name}" '
@@ -556,11 +580,6 @@ def expand_meta_label(
     return list(dict.fromkeys(expanded_labels))
 
 
-def raise_exception(exc):
-    """Task to raise an exception using the worker pool."""
-    raise exc
-
-
 def get_job_labels(job):
     """Get job labels."""
     return list(dict.fromkeys(label.lower() for label in job.raw_data["labels"]))
@@ -755,133 +774,138 @@ def create_server(
     ssh_keys: list[SSHKey],
     volumes: list[BoundVolume],
     timeout: float = 60,
-    canceled: threading.Event = None,
-    semaphore: threading.Semaphore = None,
-    active_attempt: list[int] = None,
-    attempt: int = 0,
 ):
-    """Create specified number of server instances."""
+    """Create and register one runner, retaining uncertain creations for cleanup."""
     start_time = time.time()
+    client = Client(token=hetzner_token)
+    server_labels = {
+        f"github-hetzner-runner-label-{i}": value for i, value in enumerate(labels)
+    }
+    server_labels[server_ssh_key_label] = ssh_keys[0].name
+    server_labels[github_runner_label] = "active"
+    valid, error_msg = LabelValidator.validate_verbose(labels=server_labels)
+    if not valid:
+        raise ValueError(f"invalid server labels {server_labels}: {error_msg}")
 
-    while True:
-        if semaphore is None or semaphore.acquire(timeout=1.0):
-            try:
-                if canceled is not None and canceled.is_set():
-                    with Action(
-                        f"Server creation for {name} with labels {labels} of {server_type} in {'None' if not server_location else server_location.name} canceled",
-                        level=logging.DEBUG,
-                        stacklevel=3,
-                        server_name=name,
-                    ):
-                        raise CanceledServerCreation("Server creation canceled")
-
-                if active_attempt is not None:
-                    # only proceed if this is our turn
-                    if active_attempt[0] != attempt:
-                        continue
-                    # increment the attempt number so that if we fail
-                    # another attempt can proceed next time
-                    active_attempt[0] += 1
-
-                client = Client(token=hetzner_token)
-                server_labels = {
-                    f"github-hetzner-runner-label-{i}": value
-                    for i, value in enumerate(labels)
-                }
-                server_labels[server_ssh_key_label] = ssh_keys[0].name
-                server_labels[github_runner_label] = "active"
-
-                with Action(
-                    f"Validating server {name} labels {labels} of {server_type} in {'None' if not server_location else server_location.name}",
-                    level=logging.DEBUG,
-                    stacklevel=3,
-                    server_name=name,
-                ):
-                    valid, error_msg = LabelValidator.validate_verbose(
-                        labels=server_labels
-                    )
-                    if not valid:
-                        raise ValueError(
-                            f"invalid server labels {server_labels}: {error_msg}"
-                        )
-
-                with volumes_lock:
-                    server_bound_volumes: list[BoundVolume] = []
-                    try:
-                        if server_volumes:
-                            with Action(
-                                f"Preparing volumes for server {name} with labels {labels} of {server_type} in {'None' if not server_location else server_location.name}",
-                                level=logging.DEBUG,
-                                stacklevel=3,
-                                server_name=name,
-                            ) as action:
-                                server_bound_volumes = get_server_bound_volumes(
-                                    action,
-                                    client,
-                                    server_image,
-                                    server_location,
-                                    server_volumes,
-                                    volumes,
-                                )
-
-                        with Action(
-                            f"Creating server {name} with labels {labels} of {server_type} in {'None' if not server_location else server_location.name}",
-                            stacklevel=3,
-                            server_name=name,
-                        ):
-                            response = client.servers.create(
-                                name=name,
-                                server_type=server_type,
-                                location=server_location,
-                                volumes=server_bound_volumes,
-                                automount=False,
-                                image=server_image,
-                                ssh_keys=ssh_keys,
-                                labels=server_labels,
-                                public_net=server_net_config,
-                            )
-                            server: BoundServer = response.server
-                            server.volumes = server_bound_volumes
-
-                            for volume in server_bound_volumes:
-                                volume.server = server
-
-                    except Exception as e:
-                        for volume in server_bound_volumes:
-                            # mark server bound volume as not attached to any server
-                            volume.server = None
-                        raise
-
-                metrics.record_server_creation(
-                    server_type=server_type.name,
-                    location=server_location.name if server_location else None,
-                    creation_time=time.time() - start_time,
+    server_bound_volumes = []
+    with volumes_lock if server_volumes else nullcontext():
+        if server_volumes:
+            with Action("Preparing runner volumes", server_name=name) as action:
+                server_bound_volumes = get_server_bound_volumes(
+                    action,
+                    client,
+                    server_image,
+                    server_location,
+                    server_volumes,
+                    volumes,
                 )
+        try:
+            with Action(
+                f"Creating {server_type.name} server in "
+                f"{server_location.name if server_location else 'default location'}",
+                server_name=name,
+            ):
+                response = client.servers.create(
+                    name=name,
+                    server_type=server_type,
+                    location=server_location,
+                    volumes=server_bound_volumes,
+                    automount=False,
+                    image=server_image,
+                    ssh_keys=ssh_keys,
+                    labels=server_labels,
+                    public_net=server_net_config,
+                )
+        except Exception:
+            # A lost response may still have allocated the named server and volumes.
+            existing = client.servers.get_by_name(name)
+            for volume in server_bound_volumes:
+                volume.server = existing
+            if existing is not None:
+                raise RuntimeError(
+                    f"Creation of {name} is uncertain; retaining server "
+                    f"{existing.id} for reconciliation"
+                )
+            raise
+        server = response.server
+        server.volumes = server_bound_volumes
+        for volume in server_bound_volumes:
+            volume.server = server
 
-                with Action(
-                    f"Successfully created server {name} with labels {labels} of {server_type} in {'None' if not server_location else server_location.name}, canceling other attempts",
-                    level=logging.DEBUG,
-                    stacklevel=3,
-                    server_name=name,
-                ):
-                    canceled.set()
-                # break out of the loop
-                break
+    try:
+        response.action.wait_until_finished(max_retries=timeout)
+        for action in response.next_actions or []:
+            action.wait_until_finished(max_retries=timeout)
+    except ActionFailedException as exc:
+        error = exc.action.error or {}
+        if error.get("code") != "resource_unavailable":
+            raise
+        server.reload()
+        if server.status != Server.STATUS_OFF:
+            raise RuntimeError(
+                f"Capacity failure left {name} in {server.status}; "
+                "retaining it for reconciliation"
+            ) from exc
+        server.delete().wait_until_finished(max_retries=timeout)
+        for volume in server_bound_volumes:
+            volume.server = None
+        raise APIException(
+            code=error["code"],
+            message=error.get("message", ""),
+            details=error.get("details"),
+        ) from exc
 
-            finally:
-                if semaphore is not None:
-                    semaphore.release()
-
-    setup_worker_pool.submit(
+    metrics.record_server_creation(
+        server_type=server_type.name,
+        location=server_location.name if server_location else None,
+        creation_time=time.time() - start_time,
+    )
+    setup_future = setup_worker_pool.submit(
         server_setup,
-        server=response.server,
+        server=server,
         setup_script=setup_script,
         startup_script=startup_script,
         github_token=github_token,
         github_repository=github_repository,
         runner_labels=",".join(labels),
         timeout=timeout,
+        deadline=time.monotonic() + timeout,
     )
+    try:
+        setup_future.result(timeout=timeout + 5)
+    except (TimeoutError, FutureTimeoutError):
+        setup_future.cancel()
+        raise
+    return server
+
+
+def create_server_with_fallback(candidates, **kwargs):
+    """Try provider capacity alternatives within one runner reservation."""
+    for index, (server_type, server_location, startup_script) in enumerate(candidates):
+        try:
+            return create_server(
+                server_type=server_type,
+                server_location=server_location,
+                startup_script=startup_script,
+                **kwargs,
+            )
+        except Exception as exc:
+            exc.server_type = server_type
+            exc.server_location = server_location
+            if (
+                not isinstance(exc, APIException)
+                or exc.code != "resource_unavailable"
+                or index == len(candidates) - 1
+            ):
+                raise
+            with Action(
+                f"Capacity unavailable for {server_type.name} in "
+                f"{server_location.name if server_location else 'default location'}; "
+                "trying the next alternative",
+                server_name=kwargs["name"],
+            ):
+                pass
+    raise ValueError("At least one server type/location is required")
 
 
 def recycle_server(
@@ -961,7 +985,7 @@ def recycle_server(
                     details=getattr(exc, "details", None),
                 ) from exc
 
-    setup_worker_pool.submit(
+    setup_future = setup_worker_pool.submit(
         server_setup,
         server=server,
         setup_script=setup_script,
@@ -970,7 +994,14 @@ def recycle_server(
         github_repository=github_repository,
         runner_labels=",".join(labels),
         timeout=timeout,
+        deadline=time.monotonic() + timeout,
     )
+    try:
+        setup_future.result(timeout=timeout + 5)
+    except (TimeoutError, FutureTimeoutError):
+        setup_future.cancel()
+        raise
+    return server
 
 
 def count_available_runners(runners: list[SelfHostedActionsRunner], labels: list[str]):
@@ -986,6 +1017,14 @@ def count_available_runners(runners: list[SelfHostedActionsRunner], labels: list
                     count += 1
 
     return count
+
+
+def reserve_idle_runner(runners, labels):
+    for runner in runners:
+        if count_available_runners([runner], labels):
+            runners.remove(runner)
+            return True
+    return False
 
 
 def count_available(servers: list[RunnerServer], labels: list[str]):
@@ -1032,7 +1071,7 @@ def max_servers_in_workflow_run_reached(
         run_id=run_id,
         server_name=server_name,
     ):
-        run_server_name_prefix = f"{server_name_prefix}{run_id}"
+        run_server_name_prefix = f"{server_name_prefix}{run_id}-"
         servers_in_run = [
             server
             for server in servers
@@ -1200,17 +1239,10 @@ def scale_up(
         volumes: list[BoundVolume],
     ):
         """Create new server that would provide a runner with given labels."""
-        recyclable_servers: list[BoundServer] = []
-
-        # signal to stop creating a new server
-        create_server_canceled = threading.Event()
-        # semaphore to limit the number of concurrent server creations to 1
-        create_server_semaphore = threading.Semaphore(1)
-        # active_attempt
-        create_server_active_attempt = [0]
-        # attempt number
-        create_server_attempt = -1
-
+        if any(server.name == name for server in servers) or any(
+            future.server_name == name for future in futures
+        ):
+            return
         labels = expand_meta_label(meta_label=meta_label, labels=labels)
 
         server_types = get_server_types(
@@ -1262,8 +1294,6 @@ def scale_up(
 
                     for server in servers:
                         if server.name.startswith(recycle_server_name_prefix):
-                            recyclable_servers.append(server)
-
                             with Action(
                                 f"Checking if we can recycle {server.name}",
                                 stacklevel=3,
@@ -1280,11 +1310,28 @@ def scale_up(
                                 server_net_config=server_net_config,
                                 ssh_key=ssh_keys[0],
                             ):
-                                recycle_script = get_recycle_script(
-                                    scripts=scripts,
-                                    labels=labels,
-                                    label_prefix=label_prefix,
-                                ) if recycle_without_rebuild else None
+                                if max_servers_for_label:
+                                    reached, _ = check_max_servers_for_label_reached(
+                                        max_servers_for_label,
+                                        labels,
+                                        [
+                                            existing
+                                            for existing in servers
+                                            if existing is not server
+                                        ],
+                                        futures,
+                                    )
+                                    if reached:
+                                        continue
+                                recycle_script = (
+                                    get_recycle_script(
+                                        scripts=scripts,
+                                        labels=labels,
+                                        label_prefix=label_prefix,
+                                    )
+                                    if recycle_without_rebuild
+                                    else None
+                                )
                                 future = worker_pool.submit(
                                     recycle_server,
                                     server_name=server.name,
@@ -1323,107 +1370,64 @@ def scale_up(
                                 ):
                                     pass
 
-        for server_type in server_types:
-            for server_location in server_locations:
-                # pre-increment the attempt number that starts from 0
-                create_server_attempt += 1
+        if (
+            max_servers is not None
+            and get_total_server_count(servers, futures) >= max_servers
+        ):
+            exc = MaxNumberOfServersReached(
+                f"maximum number of servers reached {get_total_server_count(servers, futures)}/{max_servers}"
+            )
+            mailbox.put(ScaleUpFailureMessage(time.time(), labels, name, exc))
+            raise StopIteration(str(exc))
 
-                startup_script = get_startup_script(
+        if max_servers_for_label:
+            reached, info = check_max_servers_for_label_reached(
+                max_servers_for_label, labels, servers, futures
+            )
+            if reached:
+                label_set, count, limit = info
+                with Action(
+                    f"Maximum number of servers for labels {label_set} reached {count}/{limit}",
+                    server_name=name,
+                ):
+                    pass
+                return
+
+        candidates = [
+            (
+                server_type,
+                server_location,
+                get_startup_script(
                     scripts=scripts,
                     server_type=server_type,
                     labels=labels,
                     label_prefix=label_prefix,
-                )
-
-                with Action(
-                    f"Trying to create new server {name} of {server_type} in {'None' if not server_location else server_location.name} with volumes {server_volumes}",
-                    stacklevel=3,
-                    level=logging.DEBUG,
-                    server_name=name,
-                ):
-                    pass
-
-                if max_servers is not None:
-                    total_servers_count = get_total_server_count(servers, futures)
-                    if total_servers_count >= max_servers:
-                        with Action(
-                            f"Maximum number of servers {max_servers} has been reached",
-                            stacklevel=3,
-                            server_name=name,
-                        ):
-                            future = worker_pool.submit(
-                                raise_exception,
-                                exc=MaxNumberOfServersReached(
-                                    f"maximum number of servers reached {total_servers_count}/{max_servers}"
-                                ),
-                            )
-                            set_future_attributes(
-                                future,
-                                name,
-                                server_type,
-                                server_location,
-                                server_volumes,
-                                labels,
-                            )
-                            futures.append(future)
-                            raise StopIteration("maximum number of servers reached")
-
-                # Check label-specific limits
-                if max_servers_for_label:
-                    limit_reached, limit_info = check_max_servers_for_label_reached(
-                        max_servers_for_label, labels, servers, futures
-                    )
-                    if limit_reached:
-                        label_set, count, max_count = limit_info
-                        with Action(
-                            f"Maximum number of servers {max_count} for labels {label_set} reached",
-                            stacklevel=3,
-                            server_name=name,
-                        ):
-                            future = worker_pool.submit(
-                                raise_exception,
-                                exc=MaxNumberOfServersForLabelReached(
-                                    f"Maximum number of servers for labels {label_set} reached {count}/{max_count}"
-                                ),
-                            )
-                            set_future_attributes(
-                                future,
-                                name,
-                                server_type,
-                                server_location,
-                                server_volumes,
-                                labels,
-                            )
-                            futures.append(future)
-                            return
-
-                future = worker_pool.submit(
-                    create_server,
-                    hetzner_token=hetzner_token,
-                    setup_worker_pool=setup_worker_pool,
-                    labels=labels,
-                    name=name,
-                    server_type=server_type,
-                    server_location=server_location,
-                    server_volumes=server_volumes,
-                    server_image=server_image,
-                    server_net_config=server_net_config,
-                    setup_script=setup_script,
-                    startup_script=startup_script,
-                    github_token=github_token,
-                    github_repository=github_repository,
-                    ssh_keys=ssh_keys,
-                    volumes=volumes,
-                    timeout=max_server_ready_time,
-                    canceled=create_server_canceled,
-                    semaphore=create_server_semaphore,
-                    active_attempt=create_server_active_attempt,
-                    attempt=create_server_attempt,
-                )
-                set_future_attributes(
-                    future, name, server_type, server_location, server_volumes, labels
-                )
-                futures.append(future)
+                ),
+            )
+            for server_type in server_types
+            for server_location in server_locations
+        ]
+        future = worker_pool.submit(
+            create_server_with_fallback,
+            candidates=candidates,
+            hetzner_token=hetzner_token,
+            setup_worker_pool=setup_worker_pool,
+            labels=labels,
+            name=name,
+            server_volumes=server_volumes,
+            server_image=server_image,
+            server_net_config=server_net_config,
+            setup_script=setup_script,
+            github_token=github_token,
+            github_repository=github_repository,
+            ssh_keys=ssh_keys,
+            volumes=volumes,
+            timeout=max_server_ready_time,
+        )
+        set_future_attributes(
+            future, name, server_types[0], server_locations[0], server_volumes, labels
+        )
+        futures.append(future)
 
     with Action("Logging in to GitHub"):
         github = Github(auth=Auth.Token(github_token), per_page=100)
@@ -1450,6 +1454,7 @@ def scale_up(
                 metrics.update_heartbeat()
 
                 futures: list[Future] = []
+                processed_jobs = set()
                 workflow_runs = []
                 runs_jobs = []
                 servers = []
@@ -1557,13 +1562,31 @@ def scale_up(
                 metrics.update_volumes(all_volumes)
                 metrics.update_system_health()
 
+                uncovered_jobs = {
+                    (job.run_id, job.id): get_job_labels(job)
+                    for _, job in runs_jobs
+                    if job.status == "queued"
+                }
+                owned_job_servers = {
+                    f"{server_name_prefix}{job.run_id}-{job.id}" for _, job in runs_jobs
+                }
+                available_runners = [
+                    runner
+                    for runner in runners
+                    if get_runner_server_name(runner.name) not in owned_job_servers
+                ]
+
                 with Action(
                     "Looking for queued jobs",
                     level=logging.DEBUG,
                     interval=interval,
                 ):
                     try:
-                        for run in workflow_runs:
+                        for run, desired_status in [
+                            (run, status)
+                            for status in ("queued", "in_progress")
+                            for run in workflow_runs
+                        ]:
                             with Action(
                                 f"Checking jobs for workflow run {run}",
                                 level=logging.DEBUG,
@@ -1581,8 +1604,12 @@ def scale_up(
                                     continue
 
                             for job_run, job in runs_jobs:
-                                if job_run.id != run.id:
+                                if job_run.id != run.id or job.status != desired_status:
                                     continue
+                                job_key = (job.run_id, job.id)
+                                if job_key in processed_jobs:
+                                    continue
+                                processed_jobs.add(job_key)
                                 if terminate.is_set():
                                     raise StopIteration("terminating")
 
@@ -1601,16 +1628,28 @@ def scale_up(
                                 )
 
                                 if job.status != "completed":
-                                    if server_name in [
-                                        server.name for server in servers
-                                    ]:
-                                        with Action(
-                                            f"Server already exists for {job.status} {job}",
-                                            level=logging.DEBUG,
-                                            server_name=server_name,
-                                            interval=interval,
+                                    existing_server = next(
+                                        (
+                                            server
+                                            for server in servers
+                                            if server.name == server_name
+                                        ),
+                                        None,
+                                    )
+                                    if existing_server is not None:
+                                        if job.status == "queued" and (
+                                            (
+                                                existing_server.server_status
+                                                != Server.STATUS_OFF
+                                                and existing_server.status
+                                                in ("initializing", "ready")
+                                            )
+                                            or reserve_idle_runner(
+                                                available_runners, labels
+                                            )
                                         ):
-                                            continue
+                                            uncovered_jobs.pop(job_key, None)
+                                        continue
 
                                     if job.status == "in_progress":
                                         # skip jobs running on external runners (not managed by this service)
@@ -1639,6 +1678,21 @@ def scale_up(
                                                 )
                                             )
 
+                                    demand_key = job_key
+                                    if job.status == "in_progress":
+                                        demand_key = next(
+                                            (
+                                                key
+                                                for key, demand_labels in uncovered_jobs.items()
+                                                if set(demand_labels).issubset(
+                                                    set(labels)
+                                                )
+                                            ),
+                                            None,
+                                        )
+                                        if demand_key is None:
+                                            continue
+
                                     if max_servers_in_workflow_run is not None:
                                         if max_servers_in_workflow_run_reached(
                                             run_id=run.id,
@@ -1659,25 +1713,18 @@ def scale_up(
                                         ):
                                             continue
 
-                                    with Action(
-                                        f"Checking available runners for {job}"
+                                    if job.status == "queued" and reserve_idle_runner(
+                                        available_runners, labels
                                     ):
-                                        available = count_available_runners(
-                                            runners=runners, labels=labels
-                                        )
-                                        if available > 0:
-                                            with Action(
-                                                f"Found at least one potentially available runner for {job}",
-                                                server_name=server_name,
-                                                interval=interval,
-                                            ):
-                                                continue
+                                        uncovered_jobs.pop(job_key, None)
+                                        continue
                                     try:
                                         with Action(
                                             f"Creating new server for {job}",
                                             server_name=server_name,
                                             interval=interval,
                                         ):
+                                            reserved_before = len(futures)
                                             create_runner_server(
                                                 name=server_name,
                                                 labels=labels,
@@ -1686,6 +1733,8 @@ def scale_up(
                                                 servers=servers,
                                                 volumes=volumes,
                                             )
+                                            if len(futures) > reserved_before:
+                                                uncovered_jobs.pop(demand_key, None)
                                     except StopIteration:
                                         raise
                                     except Exception:
@@ -1746,33 +1795,35 @@ def scale_up(
                         interval=interval,
                     ):
                         try:
-                            future.result()
+                            created_server = future.result()
                             servers.append(
                                 RunnerServer(
                                     name=future.server_name,
-                                    server_type=future.server_type,
-                                    server_location=future.server_location,
+                                    server_type=created_server.server_type,
+                                    server_location=created_server.location,
                                     server_volumes=future.server_volumes,
-                                    server_status=future.server_volumes,
+                                    server_status=created_server.status,
+                                    server=created_server,
                                     labels=set(future.server_labels),
                                 )
                             )
 
-                        except CanceledServerCreation:
-                            pass
-
                         except Exception as exc:
                             try:
                                 send_failure = False
+                                failed_type = getattr(
+                                    exc, "server_type", future.server_type
+                                )
+                                failed_location = getattr(
+                                    exc, "server_location", future.server_location
+                                )
 
                                 error_type = "error"
                                 error_details = {
                                     "error": str(exc),
-                                    "server_type": future.server_type.name,
+                                    "server_type": failed_type.name,
                                     "location": (
-                                        future.server_location.name
-                                        if future.server_location
-                                        else ""
+                                        failed_location.name if failed_location else ""
                                     ),
                                     "labels": ",".join(future.server_labels),
                                     "timestamp": time.time(),
@@ -1791,11 +1842,9 @@ def scale_up(
                                 metrics.record_scale_up_failure(
                                     error_type=error_type,
                                     server_name=future.server_name,
-                                    server_type=future.server_type.name,
+                                    server_type=failed_type.name,
                                     server_location=(
-                                        future.server_location.name
-                                        if future.server_location
-                                        else ""
+                                        failed_location.name if failed_location else ""
                                     ),
                                     error_details=error_details,
                                 )

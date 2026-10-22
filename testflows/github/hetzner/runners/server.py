@@ -108,9 +108,8 @@ def wait_ssh(server: Server, timeout: float):
     ip = ip_address(server=server)
 
     attempt = -1
-    start_time = time.time()
-
-    while True:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         attempt += 1
         with Action(
             f"Trying to connect to {server.name}@{ip}...{attempt}",
@@ -118,19 +117,29 @@ def wait_ssh(server: Server, timeout: float):
             stacklevel=3,
             server_name=server.name,
         ):
-            returncode = ssh(server, "hostname", check=False, stacklevel=4)
-            if returncode == 0:
-                break
-        if time.time() - start_time >= timeout:
-            ssh(server, "hostname")
-        else:
-            time.sleep(5)
+            try:
+                returncode = ssh(
+                    server,
+                    "hostname",
+                    check=False,
+                    stacklevel=4,
+                    timeout=min(10, max(0.001, deadline - time.monotonic())),
+                )
+            except TimeoutError:
+                pass
+            else:
+                if returncode == 0:
+                    return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(5, remaining))
+    raise TimeoutError(f"SSH to {server.name} was not ready within {timeout}s")
 
 
 def ssh_command(server: Server, options: str = ""):
     """Return ssh command."""
     ip = ip_address(server=server)
-    return f'ssh -q -o "StrictHostKeyChecking no" -o "UserKnownHostsFile=/dev/null" {options}{" " if options else ""}root@{ip}'
+    return f'ssh -q -o "StrictHostKeyChecking no" -o "UserKnownHostsFile=/dev/null" -o "BatchMode=yes" -o "ConnectTimeout=10" -o "ServerAliveInterval=10" -o "ServerAliveCountMax=2" {options}{" " if options else ""}root@{ip}'
 
 
 def ssh(server: Server, cmd: str, *args, stacklevel=3, **kwargs):

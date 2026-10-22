@@ -61,12 +61,17 @@ jobs:
       - name: Verify worker and hold overlap window
         env:
           EXPECTED_OUTCOME: ${{ inputs.outcome }}
+          WORKER_COUNT: ${{ inputs.workers }}
         run: |
           set -eu
           date -u +'%Y-%m-%dT%H:%M:%SZ'
           uname -m
           docker info --format 'Docker {{.ServerVersion}}'
-          sleep 180
+          if [ "$WORKER_COUNT" = 1 ]; then
+            sleep 60
+          else
+            sleep 180
+          fi
           date -u +'%Y-%m-%dT%H:%M:%SZ'
           if [ "$EXPECTED_OUTCOME" = failure ]; then
             echo 'Intentional failure to verify worker cleanup'

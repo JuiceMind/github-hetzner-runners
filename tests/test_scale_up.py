@@ -370,6 +370,54 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(pool.futures), 0)
         self.assertEqual(calls, [])
 
+    def test_spare_capacity_named_for_running_job_covers_queued_demand(self):
+        for spare_state in ("idle", "initializing"):
+            with self.subTest(spare_state=spare_state):
+                a = "github-hetzner-runner-100-1"
+                b = "github-hetzner-runner-200-1"
+                c = "github-hetzner-runner-90-1"
+                worker_b, job_b = self.busy_runner_and_job(a, run_id=200, runner_id=42)
+                worker_c, job_c = self.busy_runner_and_job(c, run_id=201, runner_id=43)
+                runners = [worker_b, worker_c]
+                if spare_state == "idle":
+                    runners.append(
+                        SimpleNamespace(
+                            id=44,
+                            name=b + "-cx33-nbg1",
+                            status="online",
+                            busy=False,
+                            labels=[{"name": label} for label in LABELS],
+                        )
+                    )
+                pool, calls, _ = self.run_cycle(
+                    count=1,
+                    existing=[runner_server(a), runner_server(b), runner_server(c)],
+                    runners=runners,
+                    running_jobs=[job_b, job_c],
+                )
+                self.assertEqual(len(pool.futures), 0)
+                self.assertEqual(calls, [])
+
+    def test_spare_initializing_server_covers_only_one_job(self):
+        pool, calls, _ = self.run_cycle(
+            count=3,
+            existing=[runner_server("github-hetzner-runner-99-1")],
+        )
+        self.assertEqual(len(pool.futures), 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_spare_initializing_server_must_match_queued_labels(self):
+        pool, calls, _ = self.run_cycle(
+            count=3,
+            existing=[
+                runner_server(
+                    "github-hetzner-runner-99-1", labels=["self-hosted", "other-pool"]
+                )
+            ],
+        )
+        self.assertEqual(len(pool.futures), 3)
+        self.assertEqual(len(calls), 3)
+
     def test_one_capacity_failure_does_not_block_other_jobs(self):
         attempts = []
 

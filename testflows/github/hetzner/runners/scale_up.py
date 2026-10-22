@@ -1019,10 +1019,14 @@ def count_available_runners(runners: list[SelfHostedActionsRunner], labels: list
     return count
 
 
-def reserve_idle_runner(runners, labels):
+def reserve_available_capacity(runners, initializing_servers, labels):
     for runner in runners:
         if count_available_runners([runner], labels):
             runners.remove(runner)
+            return True
+    for server in initializing_servers:
+        if set(labels).issubset(server.labels):
+            initializing_servers.remove(server)
             return True
     return False
 
@@ -1568,12 +1572,28 @@ def scale_up(
                     if job.status == "queued"
                 }
                 owned_job_servers = {
-                    f"{server_name_prefix}{job.run_id}-{job.id}" for _, job in runs_jobs
+                    f"{server_name_prefix}{job.run_id}-{job.id}"
+                    for _, job in runs_jobs
+                    if job.status == "queued"
                 }
                 available_runners = [
                     runner
                     for runner in runners
                     if get_runner_server_name(runner.name) not in owned_job_servers
+                ]
+
+                busy_server_names = {
+                    get_runner_server_name(runner.name)
+                    for runner in runners
+                    if runner.busy
+                }
+                available_initializing_servers = [
+                    server
+                    for server in servers
+                    if server.name not in owned_job_servers
+                    and server.name not in busy_server_names
+                    and server.server_status != Server.STATUS_OFF
+                    and server.status == "initializing"
                 ]
 
                 with Action(
@@ -1644,8 +1664,10 @@ def scale_up(
                                                 and existing_server.status
                                                 in ("initializing", "ready")
                                             )
-                                            or reserve_idle_runner(
-                                                available_runners, labels
+                                            or reserve_available_capacity(
+                                                available_runners,
+                                                available_initializing_servers,
+                                                labels,
                                             )
                                         ):
                                             uncovered_jobs.pop(job_key, None)
@@ -1713,8 +1735,13 @@ def scale_up(
                                         ):
                                             continue
 
-                                    if job.status == "queued" and reserve_idle_runner(
-                                        available_runners, labels
+                                    if (
+                                        job.status == "queued"
+                                        and reserve_available_capacity(
+                                            available_runners,
+                                            available_initializing_servers,
+                                            labels,
+                                        )
                                     ):
                                         uncovered_jobs.pop(job_key, None)
                                         continue

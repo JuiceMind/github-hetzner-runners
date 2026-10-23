@@ -569,6 +569,106 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(order, ["nbg1", "deleted", "fsn1"])
         self.setup.submit.assert_called_once()
 
+    def run_fallback(self):
+        kwargs = {
+            k: v
+            for k, v in self.kwargs.items()
+            if k not in {"server_type", "server_location", "startup_script"}
+        }
+        return scaling.create_server_with_fallback(
+            candidates=[
+                (ServerType(name="cx33"), Location(name=region), "startup.sh")
+                for region in ("nbg1", "fsn1")
+            ],
+            **kwargs,
+        )
+
+    def assert_provider_removed_server_retries(self):
+        self.server.reload.side_effect = APIException("not_found", "server gone", None)
+        second_server = MagicMock()
+        self.client.servers.create.side_effect = [
+            self.response,
+            SimpleNamespace(server=second_server, action=MagicMock(), next_actions=[]),
+        ]
+        self.assertIs(self.run_fallback(), second_server)
+        self.assertEqual(
+            [
+                call.kwargs["location"].name
+                for call in self.client.servers.create.call_args_list
+            ],
+            ["nbg1", "fsn1"],
+        )
+        self.server.delete.assert_not_called()
+        self.setup.submit.assert_called_once()
+
+    def test_provider_removed_failed_create_retries_next_region(self):
+        self.response.action.wait_until_finished.side_effect = self.action_error()
+        self.assert_provider_removed_server_retries()
+
+    def test_provider_removed_failed_start_retries_next_region(self):
+        self.response.next_actions[0].wait_until_finished.side_effect = (
+            self.action_error()
+        )
+        self.assert_provider_removed_server_retries()
+
+    def test_confirmed_absence_releases_volumes_before_fallback(self):
+        volume = MagicMock()
+        self.kwargs["server_volumes"] = [MagicMock()]
+        patch.object(scaling, "get_server_bound_volumes", return_value=[volume]).start()
+        self.response.action.wait_until_finished.side_effect = self.action_error()
+        self.server.reload.side_effect = APIException("not_found", "server gone", None)
+        with self.assertRaises(APIException) as caught:
+            scaling.create_server(**self.kwargs)
+        self.assertEqual(caught.exception.code, "resource_unavailable")
+        self.assertIsNone(volume.server)
+        self.server.delete.assert_not_called()
+
+    def test_unexpected_reload_error_prevents_fallback(self):
+        self.response.action.wait_until_finished.side_effect = self.action_error()
+        self.server.reload.side_effect = APIException("forbidden", "denied", None)
+        with self.assertRaises(APIException) as caught:
+            self.run_fallback()
+        self.assertEqual(caught.exception.code, "forbidden")
+        self.client.servers.create.assert_called_once()
+        self.server.delete.assert_not_called()
+
+    def test_delete_race_retries_only_after_server_absence_confirmed(self):
+        self.server.status = Server.STATUS_OFF
+        self.response.action.wait_until_finished.side_effect = self.action_error()
+        self.server.reload.side_effect = [None, APIException("not_found", "gone", None)]
+        self.server.delete.side_effect = APIException("not_found", "gone", None)
+        second_server = MagicMock()
+        self.client.servers.create.side_effect = [
+            self.response,
+            SimpleNamespace(server=second_server, action=MagicMock(), next_actions=[]),
+        ]
+        self.assertIs(self.run_fallback(), second_server)
+        self.assertEqual(self.server.reload.call_count, 2)
+        self.assertEqual(self.client.servers.create.call_count, 2)
+
+    def test_missing_delete_action_with_existing_server_prevents_fallback(self):
+        self.server.status = Server.STATUS_OFF
+        self.response.action.wait_until_finished.side_effect = self.action_error()
+        self.server.delete.return_value.wait_until_finished.side_effect = APIException(
+            "not_found", "action gone", None
+        )
+        with self.assertRaises(APIException) as caught:
+            self.run_fallback()
+        self.assertEqual(caught.exception.code, "not_found")
+        self.assertEqual(self.server.reload.call_count, 2)
+        self.client.servers.create.assert_called_once()
+
+    def test_missing_action_without_capacity_failure_prevents_fallback(self):
+        self.response.action.wait_until_finished.side_effect = APIException(
+            "not_found", "action gone", None
+        )
+        with self.assertRaises(APIException) as caught:
+            self.run_fallback()
+        self.assertEqual(caught.exception.code, "not_found")
+        self.client.servers.create.assert_called_once()
+        self.server.reload.assert_not_called()
+        self.server.delete.assert_not_called()
+
     def test_failed_deletion_prevents_fallback(self):
         self.server.status = Server.STATUS_OFF
         self.response.action.wait_until_finished.side_effect = self.action_error()

@@ -7,6 +7,7 @@ import threading
 import unittest
 from concurrent.futures import Future
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -55,11 +56,14 @@ class DeferredPool:
         return future
 
 
-def runner_server(name, labels=LABELS, status=Server.STATUS_RUNNING):
+def runner_server(
+    name, labels=LABELS, status=Server.STATUS_RUNNING, age=0, identifier=123
+):
     return SimpleNamespace(
-        id=123,
+        id=identifier,
         name=name,
         status=status,
+        created=datetime.now(timezone.utc) - timedelta(seconds=age),
         labels={
             f"github-hetzner-runner-label-{i}": label for i, label in enumerate(labels)
         },
@@ -82,6 +86,8 @@ class PlannerTests(unittest.TestCase):
         create=None,
         duplicate_runs=False,
         running_jobs=None,
+        polls=None,
+        registration_timeout=300,
     ):
         jobs = [
             SimpleNamespace(
@@ -93,25 +99,34 @@ class PlannerTests(unittest.TestCase):
             for i in range(count)
         ]
         jobs.extend(running_jobs or [])
-        grouped = {}
-        for job in jobs:
-            grouped.setdefault(job.run_id, []).append(job)
-        runs = [
-            SimpleNamespace(id=run_id, jobs=lambda js=js: js)
-            for run_id, js in grouped.items()
-        ]
+        polls = polls or [{}]
+        poll = 0
+
+        def workflow_runs(status):
+            grouped = {}
+            for job in polls[poll].get("jobs", jobs):
+                grouped.setdefault(job.run_id, []).append(job)
+            if status != "queued" and not duplicate_runs:
+                return []
+            return [
+                SimpleNamespace(id=run_id, jobs=lambda js=js: js)
+                for run_id, js in grouped.items()
+            ]
+
         repo = MagicMock()
-        repo.get_workflow_runs.side_effect = lambda status: (
-            runs if status == "queued" or duplicate_runs else []
+        repo.get_workflow_runs.side_effect = workflow_runs
+        repo.get_self_hosted_runners.side_effect = lambda: (
+            polls[poll].get("runners", runners or [])
         )
-        repo.get_self_hosted_runners.return_value = runners or []
         repo.get_self_hosted_runner.side_effect = lambda runner_id: next(
             runner
-            for runner in (runners or [])
+            for runner in polls[poll].get("runners", runners or [])
             if getattr(runner, "id", None) == runner_id
         )
         client = MagicMock()
-        client.servers.get_all.return_value = existing or []
+        client.servers.get_all.side_effect = lambda **_: (
+            polls[poll].get("servers", existing or [])
+        )
         client.volumes.get_all.return_value = []
         github = MagicMock()
         github.get_repo.return_value = repo
@@ -126,12 +141,19 @@ class PlannerTests(unittest.TestCase):
             max_runners_for_label=per_label or [],
             max_runners_in_workflow_run=per_run,
             recycle=False,
+            max_runner_registration_time=registration_timeout,
         )
         calls = []
 
         def successful_create(**kwargs):
             calls.append(kwargs)
             return runner_server(kwargs["name"])
+
+        def next_poll(_):
+            nonlocal poll
+            poll += 1
+            if poll == len(polls):
+                stop.set()
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(scaling, "Client", return_value=client))
@@ -152,7 +174,7 @@ class PlannerTests(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                patch.object(scaling.time, "sleep", side_effect=lambda _: stop.set())
+                patch.object(scaling.time, "sleep", side_effect=next_poll)
             )
             scaling.scale_up(
                 stop, mailbox, pool, [SimpleNamespace(name="test-key")], cfg
@@ -417,6 +439,102 @@ class PlannerTests(unittest.TestCase):
         )
         self.assertEqual(len(pool.futures), 3)
         self.assertEqual(len(calls), 3)
+
+    def test_finished_runner_does_not_cover_next_queued_job(self):
+        name = "github-hetzner-runner-99-1"
+        registered = SimpleNamespace(
+            name=name + "-cx33-nbg1",
+            status="online",
+            busy=False,
+            labels=[{"name": label} for label in LABELS],
+        )
+        pool, calls, _ = self.run_cycle(
+            count=1,
+            existing=[runner_server(name)],
+            polls=[{"jobs": [], "runners": [registered]}, {"runners": []}],
+        )
+        self.assertEqual(len(pool.futures), 1)
+        self.assertEqual(calls[0]["name"], "github-hetzner-runner-100-1")
+
+    def test_short_job_finished_between_polls_does_not_cover_next_queue(self):
+        completed = runner_server("github-hetzner-runner-100-1")
+        next_job = SimpleNamespace(
+            id=2, run_id=101, status="queued", raw_data={"labels": LABELS}
+        )
+        pool, calls, _ = self.run_cycle(
+            count=1,
+            polls=[{}, {"servers": [completed], "jobs": [next_job]}],
+        )
+        self.assertEqual(len(pool.futures), 2)
+        self.assertEqual(
+            [call["name"] for call in calls],
+            ["github-hetzner-runner-100-1", "github-hetzner-runner-101-2"],
+        )
+
+    def test_old_unregistered_vm_does_not_cover_queue_after_restart(self):
+        pool, calls, _ = self.run_cycle(
+            count=1,
+            existing=[runner_server("github-hetzner-runner-99-1", age=301)],
+        )
+        self.assertEqual(len(pool.futures), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_registered_idle_vm_remains_available_after_initialization_window(self):
+        name = "github-hetzner-runner-99-1"
+        registered = SimpleNamespace(
+            name=name + "-cx33-nbg1",
+            status="online",
+            busy=False,
+            labels=[{"name": label} for label in LABELS],
+        )
+        pool, calls, _ = self.run_cycle(
+            count=2,
+            existing=[runner_server(name, age=301)],
+            runners=[registered],
+        )
+        self.assertEqual(len(pool.futures), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_creation_time_does_not_supply_initializing_capacity(self):
+        unknown = runner_server("github-hetzner-runner-99-1")
+        unknown.created = None
+        pool, calls, _ = self.run_cycle(count=1, existing=[unknown])
+        self.assertEqual(len(pool.futures), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_retired_vm_still_counts_towards_global_cap(self):
+        pool, calls, mailbox = self.run_cycle(
+            count=1,
+            cap=1,
+            existing=[runner_server("github-hetzner-runner-99-1", age=301)],
+        )
+        self.assertEqual(len(pool.futures), 0)
+        self.assertEqual(calls, [])
+        self.assertIsInstance(
+            mailbox.get_nowait().exception, scaling.MaxNumberOfServersReached
+        )
+
+    def test_registration_history_does_not_transfer_to_replacement_vm(self):
+        name = "github-hetzner-runner-99-1"
+        registered = SimpleNamespace(
+            name=name + "-cx33-nbg1",
+            status="online",
+            busy=False,
+            labels=[{"name": label} for label in LABELS],
+        )
+        pool, calls, _ = self.run_cycle(
+            count=1,
+            polls=[
+                {
+                    "jobs": [],
+                    "servers": [runner_server(name, identifier=1)],
+                    "runners": [registered],
+                },
+                {"servers": [runner_server(name, identifier=2)], "runners": []},
+            ],
+        )
+        self.assertEqual(len(pool.futures), 0)
+        self.assertEqual(calls, [])
 
     def test_one_capacity_failure_does_not_block_other_jobs(self):
         attempts = []

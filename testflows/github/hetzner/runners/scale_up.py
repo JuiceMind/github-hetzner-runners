@@ -1047,6 +1047,32 @@ def reserve_available_capacity(runners, initializing_servers, labels):
     return False
 
 
+def update_server_status(servers, runners, registered_servers, registration_timeout):
+    """Exclude completed ephemeral workers from spare initializing capacity."""
+    registered_servers.intersection_update(
+        (server.server.id, server.name) for server in servers
+    )
+    now = time.time()
+    filtered_runners = []
+    for server in servers:
+        identity = (server.server.id, server.name)
+        created = getattr(server.server, "created", None)
+        if (
+            identity in registered_servers
+            or created is None
+            or not 0 <= now - created.timestamp() < registration_timeout
+        ):
+            server.status = "unregistered"
+        for runner in runners:
+            if runner.name.startswith(server.name + "-"):
+                registered_servers.add(identity)
+                server.status = "unregistered"
+                if runner.status == "online":
+                    server.status = "busy" if runner.busy else "ready"
+                filtered_runners.append(runner)
+    return filtered_runners
+
+
 def count_available(servers: list[RunnerServer], labels: list[str]):
     """Return number of available servers that match labels (subset)."""
     count = 0
@@ -1246,6 +1272,7 @@ def scale_up(
     scripts: str = config.scripts
     server_prices: dict[str, dict[str, float]] = config.server_prices
     interval: int = -1
+    registered_servers = set()
 
     with Action("Logging in to Hetzner Cloud"):
         client = Client(token=hetzner_token)
@@ -1559,14 +1586,12 @@ def scale_up(
                     level=logging.DEBUG,
                     interval=interval,
                 ):
-                    filtered_runners = []
-                    for runner in runners:
-                        for server in servers:
-                            if runner.name.startswith(server.name):
-                                if runner.status == "online":
-                                    server.status = "busy" if runner.busy else "ready"
-                                filtered_runners.append(runner)
-                    runners = filtered_runners
+                    runners = update_server_status(
+                        servers,
+                        runners,
+                        registered_servers,
+                        config.max_runner_registration_time,
+                    )
 
                 # Update all metrics
                 metrics.update_servers(servers, server_prices)
@@ -1839,6 +1864,9 @@ def scale_up(
                     ):
                         try:
                             created_server = future.result()
+                            registered_servers.add(
+                                (created_server.id, future.server_name)
+                            )
                             servers.append(
                                 RunnerServer(
                                     name=future.server_name,

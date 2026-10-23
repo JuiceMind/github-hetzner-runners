@@ -840,13 +840,29 @@ def create_server(
         error = exc.action.error or {}
         if error.get("code") != "resource_unavailable":
             raise
-        server.reload()
-        if server.status != Server.STATUS_OFF:
-            raise RuntimeError(
-                f"Capacity failure left {name} in {server.status}; "
-                "retaining it for reconciliation"
-            ) from exc
-        server.delete().wait_until_finished(max_retries=timeout)
+        try:
+            server.reload()
+        except APIException as reload_error:
+            if reload_error.code != "not_found":
+                raise
+        else:
+            if server.status != Server.STATUS_OFF:
+                raise RuntimeError(
+                    f"Capacity failure left {name} in {server.status}; "
+                    "retaining it for reconciliation"
+                ) from exc
+            try:
+                server.delete().wait_until_finished(max_retries=timeout)
+            except APIException as delete_error:
+                if delete_error.code != "not_found":
+                    raise
+                try:
+                    server.reload()
+                except APIException as reload_error:
+                    if reload_error.code != "not_found":
+                        raise
+                else:
+                    raise delete_error
         for volume in server_bound_volumes:
             volume.server = None
         raise APIException(

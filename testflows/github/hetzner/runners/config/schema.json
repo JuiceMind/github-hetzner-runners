@@ -37,6 +37,15 @@
                         "examples": ["ssh-rsa AAAAB3NzaC1..."]
                     }
                 },
+                "networks": {
+                    "description": "Names of private networks that every new runner server is attached to.",
+                    "type": "array",
+                    "items": {
+                        "description": "Network name.",
+                        "type": "string",
+                        "examples": ["ci_network"]
+                    }
+                },
                 "with_label": {
                     "description": "Only create runners for jobs that have the specified label, default: self-hosted.",
                     "type": "array",

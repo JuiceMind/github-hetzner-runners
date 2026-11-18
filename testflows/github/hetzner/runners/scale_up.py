@@ -55,6 +55,7 @@ from hcloud.actions.domain import ActionFailedException
 from hcloud.ssh_keys.domain import SSHKey
 from hcloud.server_types.domain import ServerType
 from hcloud.locations.domain import Location
+from hcloud.networks.client import BoundNetwork
 from hcloud.servers.client import BoundServer, BoundVolume
 from hcloud.servers.domain import Server, ServerCreatePublicNetwork
 from hcloud.images.domain import Image
@@ -774,6 +775,7 @@ def create_server(
     ssh_keys: list[SSHKey],
     volumes: list[BoundVolume],
     timeout: float = 60,
+    server_networks: list[BoundNetwork] = None,
 ):
     """Create and register one runner, retaining uncertain creations for cleanup."""
     start_time = time.time()
@@ -815,6 +817,7 @@ def create_server(
                     ssh_keys=ssh_keys,
                     labels=server_labels,
                     public_net=server_net_config,
+                    networks=server_networks or None,
                 )
         except Exception:
             # A lost response may still have allocated the named server and volumes.
@@ -1277,6 +1280,14 @@ def scale_up(
     with Action("Logging in to Hetzner Cloud"):
         client = Client(token=hetzner_token)
 
+    networks: list[BoundNetwork] = []
+    for network_name in config.networks:
+        with Action(f"Resolving network {network_name}"):
+            network = client.networks.get_by_name(network_name)
+            if network is None:
+                raise ValueError(f"network {network_name} does not exist")
+            networks.append(network)
+
     def create_runner_server(
         name: str,
         labels: list[str],
@@ -1470,6 +1481,7 @@ def scale_up(
             ssh_keys=ssh_keys,
             volumes=volumes,
             timeout=max_server_ready_time,
+            server_networks=networks,
         )
         set_future_attributes(
             future, name, server_types[0], server_locations[0], server_volumes, labels

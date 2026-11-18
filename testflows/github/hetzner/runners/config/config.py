@@ -126,6 +126,7 @@ class Config:
     hetzner_token: str = os.getenv("HETZNER_TOKEN")
     ssh_key: str = os.path.expanduser("~/.ssh/id_rsa.pub")
     additional_ssh_keys: list[str] = None
+    networks: list[str] = None
     with_label: list[str] = None
     label_prefix: str = ""
     meta_label: dict[str, set[str]] = None
@@ -181,6 +182,9 @@ class Config:
         if self.additional_ssh_keys is None:
             self.additional_ssh_keys = []
 
+        if self.networks is None:
+            self.networks = []
+
         if self.meta_label is None:
             self.meta_label = {}
 
@@ -200,6 +204,7 @@ class Config:
                 "cloud",
                 "standby_runners",
                 "additional_ssh_keys",
+                "networks",
                 "server_prices",
             ]:
                 continue
@@ -300,6 +305,11 @@ def parse_config(filename: str):
             assert isinstance(
                 key, str
             ), f"config.additional_ssh_keys[{i}]: is not a string"
+
+    if doc.get("networks") is not None:
+        assert isinstance(doc["networks"], list), "config.networks: is not a list"
+        for i, name in enumerate(doc["networks"]):
+            assert isinstance(name, str), f"config.networks[{i}]: is not a string"
 
     if doc.get("with_label") is not None:
         assert isinstance(doc["with_label"], list), "config.with_label: is not a list"
